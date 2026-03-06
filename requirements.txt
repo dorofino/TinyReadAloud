@@ -1,0 +1,7 @@
+kokoro-onnx
+sounddevice
+numpy
+pystray
+Pillow
+keyboard
+langdetect

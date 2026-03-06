@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+installer_output/
+assets/app.ico
+*.onnx
+*.bin
+config.json
+tmpclaude-*
