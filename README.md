@@ -15,13 +15,11 @@ Select text, press **Ctrl+Alt+R**, hear it read aloud. A lightweight Windows sys
 - **Silent update** — downloads the installer to temp and runs it with `/SILENT`; the running app is killed automatically before upgrade
 - **Optional startup with Windows** — installer checkbox to add a registry Run entry
 
-## Install (from release)
+## Install
 
-1. Download the latest `TinyReadAloud-x.x.x-Setup.exe` from [Releases](https://github.com/dorofino/TinyReadAloud/releases)
-2. Run the installer
-3. Model files (~200MB) download automatically on first launch
+> **No pre-built installer yet.** A Setup .exe will be available on the [Releases](https://github.com/dorofino/TinyReadAloud/releases) page once a release is published. For now, install from source below.
 
-## Install (from source)
+### From source
 
 ### Prerequisites
 
