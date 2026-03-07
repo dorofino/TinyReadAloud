@@ -4,16 +4,20 @@ Select text, press **Ctrl+Alt+R**, hear it read aloud. A lightweight Windows sys
 
 ## Features
 
-- **Global hotkey** (Ctrl+Alt+R) to read any selected text aloud
-- **Automatic language detection** — switches between English and Spanish voices
-- **GPU acceleration** — uses CUDA with fp16 model on NVIDIA GPUs, falls back to CPU with int8
-- **Settings window** — configure hotkey, English/Spanish voices, speed, with live preview
-- **Auto-update** — checks GitHub Releases for new versions on startup
-- **System tray** — runs quietly in the background with right-click menu
+- **Global hotkey** — configurable shortcut (default `Ctrl+Alt+R`) to read any selected text aloud; press again to stop
+- **Automatic language detection** — detects English or Spanish text and switches to the appropriate voice automatically
+- **Multi-language voices** — supports American English, British English, Spanish, French, Hindi, Italian, Japanese, Portuguese, and Chinese voice codes from Kokoro
+- **GPU acceleration** — uses CUDA with fp16 model on NVIDIA GPUs; falls back to CPU with int8 model automatically
+- **Streaming TTS** — audio is streamed in chunks for fast first-word latency and responsive stop (50ms granularity)
+- **Settings window** — Tkinter dialog to configure hotkey, English/Spanish voices, and speed with live audio preview on every change
+- **System tray** — runs in the background with a dynamic icon (red = idle, green = speaking) and right-click menu for quick access to voices, speed, settings, and updates
+- **Auto-update** — checks GitHub Releases 5 seconds after launch; shows a tray notification and "Download" menu item when a new version is found
+- **Silent update** — downloads the installer to temp and runs it with `/SILENT`; the running app is killed automatically before upgrade
+- **Optional startup with Windows** — installer checkbox to add a registry Run entry
 
 ## Install (from release)
 
-1. Download the latest `TinyReadAloud-x.x.x-Setup.exe` from [Releases](https://github.com/dorof/TinyReadAloud/releases)
+1. Download the latest `TinyReadAloud-x.x.x-Setup.exe` from [Releases](https://github.com/dorofino/TinyReadAloud/releases)
 2. Run the installer
 3. Model files (~200MB) download automatically on first launch
 
@@ -27,7 +31,7 @@ Select text, press **Ctrl+Alt+R**, hear it read aloud. A lightweight Windows sys
 ### Setup
 
 ```bash
-git clone https://github.com/dorof/TinyReadAloud.git
+git clone https://github.com/dorofino/TinyReadAloud.git
 cd TinyReadAloud
 pip install -r requirements.txt
 ```
@@ -56,9 +60,29 @@ On first run, the app downloads the TTS model and voice files (~200MB) to `%LOCA
 ## Usage
 
 1. Select any text in any application
-2. Press **Ctrl+Alt+R** to hear it read aloud
-3. Press **Ctrl+Alt+R** again to stop
-4. Right-click the tray icon for settings, voice selection, and speed control
+2. Press **Ctrl+Alt+R** (or your configured hotkey) to hear it read aloud
+3. Press the hotkey again to stop playback immediately
+4. Right-click the tray icon for quick access to:
+   - **Stop Reading** — stop current playback
+   - **English Voice** — submenu to pick from all available English voices
+   - **Spanish Voice** — submenu to pick from all available Spanish voices
+   - **Speed** — Slow (0.8×), Normal (1.0×), Fast (1.2×), Very Fast (1.5×)
+   - **Settings** — open the settings window
+   - **Check for Updates** — manually check for a new version
+   - **Download vX.Y.Z** — appears when an update is available
+
+## Settings Window
+
+Open from the tray menu → **Settings**. All changes take effect after clicking **Save**.
+
+| Setting | Control | Description |
+|---------|---------|-------------|
+| **Read-aloud shortcut** | Entry + **Record** button | Click Record, then press any key combo (e.g. `F3`, `ctrl+shift+s`). The new hotkey is shown in the entry field. |
+| **English Voice** | Dropdown | Lists all Kokoro English voices (American & British). Selecting a voice plays a live preview: *"Hello! This is a preview."* |
+| **Spanish Voice** | Dropdown | Lists all Kokoro Spanish voices. Selecting a voice plays a live preview: *"Hola, esta es una vista previa."* |
+| **Speed** | Dropdown | Slow (0.8×) · Normal (1.0×) · Fast (1.2×) · Very Fast (1.5×). Changing speed plays a live preview with the current English voice. |
+
+Voice display format: `Name (Language, Gender)` — e.g. *Heart (American, Female)*.
 
 ## Build installer
 
@@ -97,20 +121,50 @@ Settings are stored in `%LOCALAPPDATA%\TinyReadAloud\config.json`:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `hotkey` | `ctrl+alt+r` | Global read-aloud shortcut |
-| `voice_en` | `af_heart` | English voice code |
+| `voice_en` | `af_heart` | English voice code (e.g. `af_heart`, `bm_george`) |
 | `voice_es` | `ef_dora` | Spanish voice code |
-| `speed` | `1.0` | Playback speed (0.8 - 1.5) |
+| `speed` | `1.0` | Playback speed — `0.8`, `1.0`, `1.2`, or `1.5` |
+
+Model and voice data files are also stored in `%LOCALAPPDATA%\TinyReadAloud\`:
+
+| File | Size | Description |
+|------|------|-------------|
+| `kokoro-v1.0.fp16.onnx` | ~160 MB | FP16 model (used with GPU/CUDA) |
+| `kokoro-v1.0.int8.onnx` | ~80 MB | INT8 model (used on CPU) |
+| `voices-v1.0.bin` | ~15 MB | Voice embeddings (NPZ) |
+
+Only the model matching your hardware is kept; the other variant is deleted automatically.
+
+## Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) | Kokoro TTS inference via ONNX Runtime |
+| onnxruntime / onnxruntime-gpu | ONNX model execution (CPU or CUDA) |
+| sounddevice | Audio playback via PortAudio |
+| numpy | Audio sample manipulation |
+| pystray | System tray icon and menu |
+| Pillow | Tray icon image generation |
+| keyboard | Global hotkey registration and capture |
+| langdetect | Automatic English/Spanish language detection |
 
 ## Project structure
 
 ```
 TinyReadAloud/
-├── app.py              Main application
-├── version.py          Version string
-├── updater.py          GitHub Releases update checker
+├── app.py              Main application (TTS worker, settings UI, tray, hotkey)
+├── version.py          Version string (__version__)
+├── updater.py          GitHub Releases update checker & silent installer download
+├── config.json         Default config (dev only; runtime config in %LOCALAPPDATA%)
 ├── requirements.txt    Python dependencies
-├── generate_icon.py    Creates assets/app.ico from tray icon
-├── tinyreadaloud.spec  PyInstaller build spec
-├── installer.iss       Inno Setup installer script
-└── build.bat           Build automation
+├── generate_icon.py    Creates assets/app.ico from the tray icon renderer
+├── tinyreadaloud.spec  PyInstaller build spec (CPU + GPU variants)
+├── installer.iss       Inno Setup installer script (startup option, silent upgrade)
+├── build.bat           Build automation (PyInstaller → Inno Setup)
+└── assets/
+    └── app.ico         Application icon (multi-size ICO)
 ```
+
+## License
+
+This project is for personal use.

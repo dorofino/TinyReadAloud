@@ -5,8 +5,8 @@ setlocal enabledelayedexpansion
 set GPU=0
 if "%1"=="--gpu" set GPU=1
 
-:: Read version from version.py
-for /f "tokens=2 delims='""'" %%a in ('findstr __version__ version.py') do set VERSION=%%a
+:: Read version from version.py using Python (reliable across quote styles)
+for /f %%a in ('python -c "from version import __version__; print(__version__)"') do set VERSION=%%a
 if "%VERSION%"=="" (
     echo ERROR: Could not read version from version.py
     exit /b 1
@@ -37,7 +37,7 @@ if not exist assets\app.ico (
 echo.
 echo === Running PyInstaller ===
 set TINYREADALOUD_GPU=%GPU%
-pyinstaller tinyreadaloud.spec --noconfirm
+python -m PyInstaller tinyreadaloud.spec --noconfirm
 if errorlevel 1 (
     echo PyInstaller failed!
     exit /b 1
