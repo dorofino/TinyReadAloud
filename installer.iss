@@ -31,6 +31,12 @@ PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 WizardStyle=modern
+CloseApplications=yes
+CloseApplicationsFilter={#MyAppExeName}
+RestartApplications=no
+UninstallRestartComputer=no
+AlwaysRestart=no
+UsePreviousAppDir=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -42,6 +48,10 @@ Name: "startup"; Description: "Start with Windows"; GroupDescription: "Other opt
 [Files]
 ; The entire PyInstaller dist folder
 Source: "dist\TinyReadAloud\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; Remove stale files from previous versions before copying new files.
+Type: filesandordirs; Name: "{app}\*"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

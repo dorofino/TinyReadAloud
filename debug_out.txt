@@ -1,0 +1,20 @@
+Loading Kokoro TTS model...
+Using GPU (CUDA) with fp16 model for TTS inference.
+TinyReadAloud v1.0.0 ready. Read: ` | Dictation: ctrl+` | Grammar: alt+` | Rephrase: ctrl+alt+p
+[Grammar] Captured 14 chars from clipboard.
+[Grammar] Corrected 15 chars.
+[Grammar] Clipboard verify: 15 chars
+[Grammar] Captured 15 chars from clipboard.
+[Grammar] Corrected 15 chars.
+[Grammar] Captured 15 chars from clipboard.
+[Grammar] Corrected 15 chars.
+[Grammar] Captured 95 chars from clipboard.
+[Grammar] Corrected 98 chars.
+[Grammar] Clipboard verify: 98 chars
+[Grammar] Hotkey fired. target_hwnd=0x0226127e
+[Grammar] Captured 98 chars from clipboard.
+[Grammar] Corrected 101 chars.
+[Grammar] Clipboard verify: 101 chars
+[Grammar] Hotkey fired. target_hwnd=0x0226127e
+[Grammar] Captured 101 chars from clipboard.
+[Grammar] Corrected 101 chars.

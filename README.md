@@ -15,11 +15,12 @@ Select text, press **Ctrl+Alt+R**, hear it read aloud. A lightweight Windows sys
 - **Silent update** — downloads the installer to temp and runs it with `/SILENT`; the running app is killed automatically before upgrade
 - **Optional startup with Windows** — installer checkbox to add a registry Run entry
 
-## Install (portable zip)
+## Install (Windows Setup)
 
-1. Download `TinyReadAloud-1.0.0-portable.zip` from [Releases](https://github.com/dorofino/TinyReadAloud/releases)
-2. Extract anywhere and run `TinyReadAloud.exe`
-3. Model files (~200MB) download automatically on first launch
+1. Download `TinyReadAloud-X.Y.Z-Setup.exe` (or `setup.exe`) from [Releases](https://github.com/dorofino/TinyReadAloud/releases)
+2. Run the installer and keep the default path in `Program Files`
+3. Re-run any newer installer to upgrade in place; existing install is overwritten
+4. Model files (~200MB) download automatically on first launch
 
 ### From source
 
@@ -98,6 +99,11 @@ build.bat
 ```
 
 This produces `installer_output\TinyReadAloud-x.x.x-Setup.exe`.
+
+Build also creates stable aliases:
+
+- `installer_output\TinyReadAloud-Setup.exe`
+- `installer_output\setup.exe`
 
 For GPU variant (includes NVIDIA CUDA DLLs, ~800MB+ installer):
 

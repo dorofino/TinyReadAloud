@@ -76,7 +76,11 @@ def download_and_run_installer(url: str, on_progress=None) -> bool:
                 on_progress(done, total)
 
         urllib.request.urlretrieve(url, dest, reporthook=reporthook)
-        subprocess.Popen([dest, "/SILENT"], shell=False)
+        # Silent in-place upgrade: close running app, suppress UI, and do not reboot.
+        subprocess.Popen(
+            [dest, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
+            shell=False,
+        )
         return True
     except Exception:
         return False

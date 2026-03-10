@@ -9,7 +9,18 @@ block_cipher = None
 
 def get_pkg_dir(pkg_name):
     mod = importlib.import_module(pkg_name)
-    return os.path.dirname(mod.__file__)
+    mod_file = getattr(mod, "__file__", None)
+    if mod_file:
+        return os.path.dirname(mod_file)
+
+    # Namespace packages (e.g. nvidia) may not define __file__.
+    mod_path = getattr(mod, "__path__", None)
+    if mod_path:
+        for p in mod_path:
+            if p:
+                return p
+
+    raise ImportError(f"Could not resolve package directory for {pkg_name}")
 
 
 # Locate package data directories
@@ -85,6 +96,12 @@ a = Analysis(
     excludes=[
         "matplotlib", "scipy", "pandas", "pytest", "IPython",
         "notebook", "sphinx", "docutils",
+        # Prevent PyInstaller from traversing unrelated heavyweight ML stacks
+        # that may exist in the local Python environment.
+        "torch", "torchvision", "torchaudio",
+        "tensorflow", "keras", "transformers",
+        "sklearn", "cv2", "numba", "librosa", "soundfile",
+        "xgboost", "lightgbm", "catboost", "faiss", "openvino",
     ],
     noarchive=False,
     optimize=0,
