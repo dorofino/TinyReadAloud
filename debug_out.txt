@@ -1,20 +1,10 @@
 Loading Kokoro TTS model...
 Using GPU (CUDA) with fp16 model for TTS inference.
-TinyReadAloud v1.0.0 ready. Read: ` | Dictation: ctrl+` | Grammar: alt+` | Rephrase: ctrl+alt+p
-[Grammar] Captured 14 chars from clipboard.
-[Grammar] Corrected 15 chars.
-[Grammar] Clipboard verify: 15 chars
-[Grammar] Captured 15 chars from clipboard.
-[Grammar] Corrected 15 chars.
-[Grammar] Captured 15 chars from clipboard.
-[Grammar] Corrected 15 chars.
-[Grammar] Captured 95 chars from clipboard.
-[Grammar] Corrected 98 chars.
-[Grammar] Clipboard verify: 98 chars
-[Grammar] Hotkey fired. target_hwnd=0x0226127e
-[Grammar] Captured 98 chars from clipboard.
-[Grammar] Corrected 101 chars.
-[Grammar] Clipboard verify: 101 chars
-[Grammar] Hotkey fired. target_hwnd=0x0226127e
-[Grammar] Captured 101 chars from clipboard.
-[Grammar] Corrected 101 chars.
+TinyReadAloud v1.0.0 ready. Read: ` | Dictation: ctrl+` | Grammar: alt+` | Rephrase: alt+1
+[Settings] Window opened 700x571 at +610+254
+[Rephrase] Hotkey fired. target_hwnd=0x00f70ae6  style='Expanded'
+[Rephrase] Phase1 focus: current_fg=0x00f70ae6  target=0x00f70ae6
+[Rephrase] SetForegroundWindow(0x00f70ae6) -> ok=1  now_fg=0x00f70ae6
+[Rephrase] Before ctrl+a/ctrl+c: fg=0x00f70ae6
+[Rephrase] Captured 0 chars. Text[:80]=''
+[Settings] Window opened 700x571 at +610+254

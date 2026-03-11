@@ -65,6 +65,9 @@ DICTATION_PROVIDERS = ["windows"]
 GRAMMAR_PROVIDERS = ["anthropic"]
 REPHRASE_STYLES = ["Natural", "Formal", "Casual", "Concise", "Expanded", "Professional"]
 DEFAULT_REPHRASE_STYLE = "Natural"
+DEFAULT_STYLE_HOTKEYS = {s: "" for s in REPHRASE_STYLES}
+RECALL_STYLE_HOTKEY = ""
+DEFAULT_MIC_DEVICE = ""  # empty = system default
 COPY_WAIT_INTERVAL = 0.02
 COPY_WAIT_TIMEOUT = 0.5
 AUDIO_CHUNK_SECS = 0.05  # 50ms playback granularity for stop responsiveness
@@ -131,6 +134,31 @@ kernel32.GlobalUnlock.restype = ctypes.wintypes.BOOL
 kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
 kernel32.GlobalFree.restype = ctypes.c_void_p
 
+# ── Win32 modifier key helpers ────────────────────────────────────────────────
+
+_VK_CONTROL = 0x11
+_VK_MENU    = 0x12   # Alt
+_VK_SHIFT   = 0x10
+_MODIFIER_VKS = (_VK_CONTROL, _VK_MENU, _VK_SHIFT)
+
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype  = ctypes.c_short
+
+def _wait_for_modifiers_released(timeout=2.0):
+    """Spin until Ctrl, Alt, and Shift are all physically released.
+
+    With suppress=False hotkeys the physical keys are still held when the
+    callback fires.  We must wait for the user to release them before
+    injecting keyboard.send('ctrl+a') etc., otherwise the target app
+    receives ctrl+alt+a instead of ctrl+a.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in _MODIFIER_VKS):
+            return
+        time.sleep(0.02)
+    # Timed out — proceed anyway (user may be holding the key intentionally)
+
 
 # ── Model Download ───────────────────────────────────────────────────────────
 
@@ -195,6 +223,9 @@ def load_config():
                 "dictation_provider": DEFAULT_DICTATION_PROVIDER,
                 "grammar_provider": DEFAULT_GRAMMAR_PROVIDER,
                 "rephrase_style": DEFAULT_REPHRASE_STYLE,
+                "style_hotkeys": dict(DEFAULT_STYLE_HOTKEYS),
+                "recall_style_hotkey": RECALL_STYLE_HOTKEY,
+                "mic_device": DEFAULT_MIC_DEVICE,
                 "anthropic_api_key": "",
                 "anthropic_model": ANTHROPIC_MODEL_DEFAULT}
     if not os.path.exists(CONFIG_PATH):
@@ -819,10 +850,23 @@ class FloatingStatusBar:
 # ── Settings Window ─────────────────────────────────────────────────────────
 
 class SettingsWindow:
-    """Tkinter settings dialog. Runs its own mainloop in a separate thread."""
+    """Tkinter settings dialog — modern themed, grouped into sections."""
 
     _instance_lock = threading.Lock()
     _instance = None
+
+    # Dark theme colours
+    BG      = "#1e1e2e"
+    BG2     = "#282840"
+    FG      = "#cdd6f4"
+    DIM     = "#6c7086"
+    ACCENT  = "#a78bfa"
+    BORDER  = "#45475a"
+    ENTRY_BG = "#313244"
+    BTN_BG  = "#585b70"
+    BTN_FG  = "#cdd6f4"
+    SAVE_BG = "#a78bfa"
+    SAVE_FG = "#1e1e2e"
 
     @classmethod
     def open(cls, app):
@@ -836,270 +880,331 @@ class SettingsWindow:
                     cls._instance = None
             win = cls(app)
             cls._instance = win
-        threading.Thread(target=win._run, daemon=True).start()
+        sb = FloatingStatusBar.get()
+        if sb and sb._root:
+            sb._root.after(0, win._run, sb._root)
+        else:
+            threading.Thread(target=win._run, daemon=True).start()
 
     def __init__(self, app):
         self._app = app
         self._root = None
         self._hotkey_var = None
         self._dictation_hotkey_var = None
+        self._grammar_hotkey_var = None
         self._grammar_mode_var = None
         self._dictation_provider_var = None
         self._grammar_provider_var = None
         self._anthropic_api_key_var = None
         self._anthropic_model_var = None
-        self._rephrase_hotkey_var = None
         self._rephrase_style_var = None
+        self._recall_style_hotkey_var = None
         self._voice_en_var = None
         self._voice_es_var = None
         self._speed_var = None
+        self._mic_device_var = None
         self._recording = False
         self._record_target = None
+        self._record_buttons = []  # all record buttons for disable/enable
         self._en_codes = []
         self._en_labels = []
         self._es_codes = []
         self._es_labels = []
+        self._style_hotkey_vars = {}
 
-    def _run(self):
-        root = tk.Tk()
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _make_section(self, parent, title):
+        """Create a labelled section frame packed into parent. Returns body frame."""
+        wrapper = tk.Frame(parent, bg=self.BG)
+        wrapper.pack(fill="x", padx=8, pady=(6, 2))
+        # Section header
+        hdr = tk.Frame(wrapper, bg=self.BG)
+        hdr.pack(fill="x", pady=(0, 2))
+        tk.Label(hdr, text=title, font=("Segoe UI Semibold", 10),
+                 bg=self.BG, fg=self.ACCENT).pack(side="left")
+        sep = tk.Frame(hdr, bg=self.BORDER, height=1)
+        sep.pack(side="left", fill="x", expand=True, padx=(8, 0), pady=1)
+        # Section body frame
+        body = tk.Frame(wrapper, bg=self.BG2, highlightbackground=self.BORDER,
+                        highlightthickness=1)
+        body.pack(fill="x")
+        body.columnconfigure(1, weight=1)
+        return body
+
+    def _add_label(self, parent, text, row, col=0, **kw):
+        lbl = tk.Label(parent, text=text, font=("Segoe UI", 9),
+                       bg=self.BG2, fg=self.FG, anchor="w")
+        lbl.grid(row=row, column=col, sticky="w", padx=(10, 4), pady=3, **kw)
+        return lbl
+
+    def _add_entry(self, parent, var, row, col=1, width=28, show=None, state="readonly"):
+        e = tk.Entry(parent, textvariable=var, width=width, font=("Segoe UI", 9),
+                     bg=self.ENTRY_BG, fg=self.FG, insertbackground=self.FG,
+                     relief="flat", highlightthickness=1,
+                     highlightbackground=self.BORDER, highlightcolor=self.ACCENT)
+        if show:
+            e.config(show=show)
+        if state == "readonly":
+            e.config(state="readonly", readonlybackground=self.ENTRY_BG)
+        e.grid(row=row, column=col, sticky="ew", padx=4, pady=3)
+        return e
+
+    def _add_record_btn(self, parent, command, row, col=2):
+        b = tk.Button(parent, text="⏺", font=("Segoe UI", 8), width=3,
+                      bg=self.BTN_BG, fg=self.BTN_FG, relief="flat",
+                      activebackground=self.ACCENT, activeforeground=self.SAVE_FG,
+                      cursor="hand2", command=command)
+        b.grid(row=row, column=col, padx=(2, 0), pady=3)
+        self._record_buttons.append(b)
+        return b
+
+    def _add_clear_btn(self, parent, var, row, col=3):
+        b = tk.Button(parent, text="✕", font=("Segoe UI", 8), width=3,
+                      bg=self.BTN_BG, fg="#f38ba8", relief="flat",
+                      activebackground="#f38ba8", activeforeground=self.SAVE_FG,
+                      cursor="hand2", command=lambda: var.set(""))
+        b.grid(row=row, column=col, padx=(2, 10), pady=3)
+        return b
+
+    def _add_combo(self, parent, var, values, row, col=1, width=26, on_change=None):
+        # Use ttk Combobox with readonly, then style it after creation
+        cb = ttk.Combobox(parent, textvariable=var, values=values,
+                          state="readonly", width=width, font=("Segoe UI", 9))
+        cb.grid(row=row, column=col, sticky="ew", padx=4, pady=3, columnspan=3)
+        if on_change:
+            cb.bind("<<ComboboxSelected>>", on_change)
+        return cb
+
+    # ── Build the window ─────────────────────────────────────────────────────
+
+    def _run(self, parent=None):
+        if parent:
+            root = tk.Toplevel(parent)
+        else:
+            root = tk.Tk()
         self._root = root
+        root.withdraw()
         root.title("TinyReadAloud Settings")
         root.resizable(False, False)
+        root.configure(bg=self.BG)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Try to set icon to match tray
+        # Try to set dark title bar on Windows 10/11
         try:
-            icon_img = create_tray_icon(size=32, speaking=False)
-            self._tk_icon = tk.PhotoImage(data=icon_img.tobytes())
+            root.update_idletasks()
+            hwnd = root.winfo_id()
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
         except Exception:
             pass
 
-        pad = {"padx": 10, "pady": 5}
-        row = 0
+        # Configure ttk style for dark combo boxes
+        style = ttk.Style(root)
+        style.theme_use("clam")
+        style.configure("TCombobox",
+                        fieldbackground=self.ENTRY_BG, background=self.BTN_BG,
+                        foreground=self.FG, arrowcolor=self.FG,
+                        bordercolor=self.BORDER, lightcolor=self.BORDER,
+                        darkcolor=self.BORDER, selectbackground=self.ACCENT,
+                        selectforeground=self.SAVE_FG)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", self.ENTRY_BG)],
+                  foreground=[("readonly", self.FG)])
+        root.option_add("*TCombobox*Listbox.background", self.ENTRY_BG)
+        root.option_add("*TCombobox*Listbox.foreground", self.FG)
+        root.option_add("*TCombobox*Listbox.selectBackground", self.ACCENT)
+        root.option_add("*TCombobox*Listbox.selectForeground", self.SAVE_FG)
 
-        # ── Hotkey ──
-        ttk.Label(root, text="Read-aloud shortcut:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
+        # ── Title bar ──
+        title_frame = tk.Frame(root, bg=self.BG)
+        title_frame.pack(fill="x", padx=16, pady=(12, 0))
+        tk.Label(title_frame, text="⚙  Settings", font=("Segoe UI Semibold", 13),
+                 bg=self.BG, fg=self.FG).pack(side="left")
+        tk.Label(title_frame, text=f"v{__version__}", font=("Segoe UI", 9),
+                 bg=self.BG, fg=self.DIM).pack(side="right")
 
-        hotkey_frame = ttk.Frame(root)
-        hotkey_frame.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
+        # ── Two-column container ──
+        columns = tk.Frame(root, bg=self.BG)
+        columns.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+        left_col = tk.Frame(columns, bg=self.BG)
+        left_col.pack(side="left", fill="both", expand=True, anchor="n")
+        right_col = tk.Frame(columns, bg=self.BG)
+        right_col.pack(side="left", fill="both", expand=True, anchor="n")
 
-        self._hotkey_var = tk.StringVar(value=self._app._hotkey)
-        hotkey_entry = ttk.Entry(hotkey_frame, textvariable=self._hotkey_var, state="readonly", width=25)
-        hotkey_entry.pack(side="left", padx=(0, 5))
+        # ══════════════════════════════════════════════════════════════════════
+        # LEFT COLUMN
+        # ══════════════════════════════════════════════════════════════════════
 
-        self._record_btn = ttk.Button(hotkey_frame, text="Record", command=self._record_hotkey)
-        self._record_btn.pack(side="left")
-        row += 1
-
-        # ── Dictation Hotkey ──
-        ttk.Label(root, text="Dictation shortcut:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
-
-        dict_frame = ttk.Frame(root)
-        dict_frame.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-
-        self._dictation_hotkey_var = tk.StringVar(value=self._app._dictation_hotkey)
-        dict_entry = ttk.Entry(dict_frame, textvariable=self._dictation_hotkey_var, state="readonly", width=25)
-        dict_entry.pack(side="left", padx=(0, 5))
-
-        self._record_dict_btn = ttk.Button(dict_frame, text="Record", command=self._record_dictation_hotkey)
-        self._record_dict_btn.pack(side="left")
-        row += 1
-
-        # ── Grammar Hotkey ──
-        ttk.Label(root, text="Grammar shortcut:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
-
-        grammar_hk_frame = ttk.Frame(root)
-        grammar_hk_frame.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-
-        self._grammar_hotkey_var = tk.StringVar(value=self._app._grammar_hotkey)
-        grammar_hk_entry = ttk.Entry(grammar_hk_frame, textvariable=self._grammar_hotkey_var, state="readonly", width=25)
-        grammar_hk_entry.pack(side="left", padx=(0, 5))
-
-        self._record_grammar_btn = ttk.Button(grammar_hk_frame, text="Record", command=self._record_grammar_hotkey)
-        self._record_grammar_btn.pack(side="left")
-        row += 1
-
-        # ── Rephrase Hotkey ──
-        ttk.Label(root, text="Rephrase shortcut:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
-
-        rephrase_hk_frame = ttk.Frame(root)
-        rephrase_hk_frame.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-
-        self._rephrase_hotkey_var = tk.StringVar(value=self._app._rephrase_hotkey)
-        rephrase_hk_entry = ttk.Entry(rephrase_hk_frame, textvariable=self._rephrase_hotkey_var, state="readonly", width=25)
-        rephrase_hk_entry.pack(side="left", padx=(0, 5))
-
-        self._record_rephrase_btn = ttk.Button(rephrase_hk_frame, text="Record", command=self._record_rephrase_hotkey)
-        self._record_rephrase_btn.pack(side="left")
-        row += 1
-
-        # ── Rephrase Style ──
-        ttk.Label(root, text="Rephrase style:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
-
-        self._rephrase_style_var = tk.StringVar(value=self._app._rephrase_style)
-        rephrase_style_combo = ttk.Combobox(
-            root,
-            textvariable=self._rephrase_style_var,
-            values=REPHRASE_STYLES,
-            state="readonly",
-            width=30,
-        )
-        rephrase_style_combo.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        row += 1
-        ttk.Label(root, text="English Voice:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
+        # ── Voice & Playback ──
+        sec = self._make_section(left_col, "Voice & Playback")
 
         all_voices = self._app.tts.voices
         self._en_codes = [v for v in all_voices if is_english_voice(v)]
         self._en_labels = [voice_display_name(v) for v in self._en_codes]
-        current_en_label = voice_display_name(self._app.tts.voice_en)
-
-        self._voice_en_var = tk.StringVar(value=current_en_label)
-        en_combo = ttk.Combobox(root, textvariable=self._voice_en_var, values=self._en_labels,
-                                state="readonly", width=30)
-        en_combo.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        en_combo.bind("<<ComboboxSelected>>", self._on_en_voice_changed)
-        row += 1
-
-        # ── Spanish Voice ──
-        ttk.Label(root, text="Spanish Voice:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
-
         self._es_codes = [v for v in all_voices if is_spanish_voice(v)]
         self._es_labels = [voice_display_name(v) for v in self._es_codes]
-        current_es_label = voice_display_name(self._app.tts.voice_es)
 
-        self._voice_es_var = tk.StringVar(value=current_es_label)
-        es_combo = ttk.Combobox(root, textvariable=self._voice_es_var, values=self._es_labels,
-                                state="readonly", width=30)
-        es_combo.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        es_combo.bind("<<ComboboxSelected>>", self._on_es_voice_changed)
-        row += 1
+        r = 0
+        self._add_label(sec, "English voice", r)
+        self._voice_en_var = tk.StringVar(value=voice_display_name(self._app.tts.voice_en))
+        self._add_combo(sec, self._voice_en_var, self._en_labels, r,
+                        on_change=self._on_en_voice_changed)
+        r += 1
 
-        # ── Speed ──
-        ttk.Label(root, text="Speed:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
+        self._add_label(sec, "Spanish voice", r)
+        self._voice_es_var = tk.StringVar(value=voice_display_name(self._app.tts.voice_es))
+        self._add_combo(sec, self._voice_es_var, self._es_labels, r,
+                        on_change=self._on_es_voice_changed)
+        r += 1
 
+        self._add_label(sec, "Speed", r)
         speed_labels = [label for label, _ in SPEED_OPTIONS]
         current_speed_label = SPEED_BY_VALUE.get(self._app.tts.current_speed, "Normal")
         self._speed_var = tk.StringVar(value=current_speed_label)
-        speed_combo = ttk.Combobox(root, textvariable=self._speed_var, values=speed_labels,
-                                   state="readonly", width=30)
-        speed_combo.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        speed_combo.bind("<<ComboboxSelected>>", self._on_speed_changed)
-        row += 1
+        self._add_combo(sec, self._speed_var, speed_labels, r,
+                        on_change=self._on_speed_changed)
 
-        # ── Grammar Mode ──
-        ttk.Label(root, text="Grammar mode:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
+        # ── Shortcuts ──
+        sec = self._make_section(left_col, "Shortcuts")
+        r = 0
 
-        grammar_values = ["off", "manual", "after_dictation"]
+        for label_text, attr_name, target_id in [
+            ("Read aloud",  "_hotkey",           "read"),
+            ("Dictation",   "_dictation_hotkey",  "dictation"),
+            ("Grammar",     "_grammar_hotkey",    "grammar"),
+        ]:
+            self._add_label(sec, label_text, r)
+            var = tk.StringVar(value=getattr(self._app, attr_name))
+            setattr(self, f"{attr_name}_var", var)
+            self._add_entry(sec, var, r)
+            self._add_record_btn(sec, lambda t=target_id: self._start_hotkey_record(t), r)
+            self._add_clear_btn(sec, var, r)
+            r += 1
+
+        # ── Grammar & Dictation ──
+        sec = self._make_section(left_col, "Grammar & Dictation")
+        r = 0
+
+        self._add_label(sec, "Grammar mode", r)
         self._grammar_mode_var = tk.StringVar(value=self._app._grammar_mode)
-        grammar_combo = ttk.Combobox(root, textvariable=self._grammar_mode_var, values=grammar_values,
-                         state="readonly", width=30)
-        grammar_combo.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        row += 1
+        self._add_combo(sec, self._grammar_mode_var, GRAMMAR_MODES, r)
+        r += 1
 
-        # ── Dictation Provider ──
-        ttk.Label(root, text="Dictation provider:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
-
+        self._add_label(sec, "Dictation provider", r)
         self._dictation_provider_var = tk.StringVar(value=self._app._dictation_provider)
-        dict_provider_combo = ttk.Combobox(
-            root,
-            textvariable=self._dictation_provider_var,
-            values=DICTATION_PROVIDERS,
-            state="readonly",
-            width=30,
-        )
-        dict_provider_combo.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        row += 1
+        self._add_combo(sec, self._dictation_provider_var, DICTATION_PROVIDERS, r)
+        r += 1
 
-        # ── Grammar Provider ──
-        ttk.Label(root, text="Grammar provider:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
+        self._add_label(sec, "Microphone", r)
+        mic_names = self._get_mic_device_names()
+        current_mic = self._app._mic_device or "System default"
+        if current_mic not in mic_names:
+            mic_names.insert(0, current_mic)
+        self._mic_device_var = tk.StringVar(value=current_mic)
+        self._add_combo(sec, self._mic_device_var, mic_names, r)
+        r += 1
 
+        self._add_label(sec, "Grammar provider", r)
         self._grammar_provider_var = tk.StringVar(value=self._app._grammar_provider)
-        grammar_provider_combo = ttk.Combobox(
-            root,
-            textvariable=self._grammar_provider_var,
-            values=GRAMMAR_PROVIDERS,
-            state="readonly",
-            width=30,
-        )
-        grammar_provider_combo.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        row += 1
+        self._add_combo(sec, self._grammar_provider_var, GRAMMAR_PROVIDERS, r)
 
-        # ── Anthropic API Key ──
-        ttk.Label(root, text="Anthropic API key:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
+        # ── Anthropic API ──
+        sec = self._make_section(left_col, "Anthropic API")
+        r = 0
 
+        self._add_label(sec, "API key", r)
         self._anthropic_api_key_var = tk.StringVar(value=self._app._anthropic_api_key)
-        anthropic_entry = ttk.Entry(root, textvariable=self._anthropic_api_key_var, show="*", width=40)
-        anthropic_entry.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        row += 1
+        self._add_entry(sec, self._anthropic_api_key_var, r, show="●", state="normal")
+        r += 1
 
-        # ── Anthropic Model ──
-        ttk.Label(root, text="Anthropic model:").grid(row=row, column=0, sticky="w", **pad)
-        row += 1
-
+        self._add_label(sec, "Model", r)
         self._anthropic_model_var = tk.StringVar(value=self._app._anthropic_model)
-        anthropic_model_entry = ttk.Entry(root, textvariable=self._anthropic_model_var, width=40)
-        anthropic_model_entry.grid(row=row, column=0, columnspan=2, sticky="ew", **pad)
-        row += 1
-        ttk.Separator(root, orient="horizontal").grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
-        row += 1
+        self._add_entry(sec, self._anthropic_model_var, r, state="normal")
 
-        # ── Save / Cancel ──
-        btn_frame = ttk.Frame(root)
-        btn_frame.grid(row=row, column=0, columnspan=2, **pad)
-        ttk.Button(btn_frame, text="Save", command=self._save).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=self._on_close).pack(side="left", padx=5)
+        # ══════════════════════════════════════════════════════════════════════
+        # RIGHT COLUMN
+        # ══════════════════════════════════════════════════════════════════════
 
-        # Center the window on screen
+        # ── Rephrase Styles ──
+        sec = self._make_section(right_col, "Rephrase Styles")
+        r = 0
+
+        self._add_label(sec, "Active style", r)
+        self._rephrase_style_var = tk.StringVar(value=self._app._rephrase_style)
+        self._add_combo(sec, self._rephrase_style_var, REPHRASE_STYLES, r)
+        r += 1
+
+        # Per-style hotkeys
+        style_hks = self._app._style_hotkeys
+        self._style_hotkey_vars = {}
+        for style_name in REPHRASE_STYLES:
+            self._add_label(sec, f"  {style_name}", r)
+            var = tk.StringVar(value=style_hks.get(style_name, ""))
+            self._style_hotkey_vars[style_name] = var
+            self._add_entry(sec, var, r)
+            self._add_record_btn(
+                sec, lambda s=style_name: self._start_hotkey_record(f"style_{s}"), r)
+            self._add_clear_btn(sec, var, r)
+            r += 1
+
+        # Recall last style hotkey
+        self._add_label(sec, "Recall last style", r)
+        self._recall_style_hotkey_var = tk.StringVar(
+            value=self._app._recall_style_hotkey)
+        self._add_entry(sec, self._recall_style_hotkey_var, r)
+        self._add_record_btn(sec, lambda: self._start_hotkey_record("recall_style"), r)
+        self._add_clear_btn(sec, self._recall_style_hotkey_var, r)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Buttons
+        # ══════════════════════════════════════════════════════════════════════
+        btn_frame = tk.Frame(root, bg=self.BG)
+        btn_frame.pack(pady=(10, 14))
+
+        save_btn = tk.Button(btn_frame, text="  Save  ", font=("Segoe UI Semibold", 10),
+                             bg=self.SAVE_BG, fg=self.SAVE_FG, relief="flat",
+                             activebackground="#b8a0ff", cursor="hand2",
+                             command=self._save)
+        save_btn.pack(side="left", padx=8)
+
+        cancel_btn = tk.Button(btn_frame, text="  Cancel  ", font=("Segoe UI", 10),
+                               bg=self.BTN_BG, fg=self.BTN_FG, relief="flat",
+                               activebackground="#6c7086", cursor="hand2",
+                               command=self._on_close)
+        cancel_btn.pack(side="left", padx=8)
+
+        # Center on screen then show
         root.update_idletasks()
-        w, h = root.winfo_width(), root.winfo_height()
+        w = max(root.winfo_reqwidth(), 700)
+        h = root.winfo_reqheight()
         x = (root.winfo_screenwidth() - w) // 2
         y = (root.winfo_screenheight() - h) // 2
-        root.geometry(f"+{x}+{y}")
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+        print(f"[Settings] Window opened {w}x{h} at +{x}+{y}", flush=True)
 
-        root.mainloop()
+        if not parent:
+            root.mainloop()
 
-    def _record_hotkey(self):
-        self._start_hotkey_record("read")
-
-    def _record_dictation_hotkey(self):
-        self._start_hotkey_record("dictation")
-
-    def _record_grammar_hotkey(self):
-        self._start_hotkey_record("grammar")
-
-    def _record_rephrase_hotkey(self):
-        self._start_hotkey_record("rephrase")
+    # ── Hotkey Recording ─────────────────────────────────────────────────────
 
     def _start_hotkey_record(self, target):
         if self._recording:
             return
         self._recording = True
         self._record_target = target
-        if target == "read":
-            self._hotkey_var.set("Press a key combo...")
-        elif target == "dictation":
-            self._dictation_hotkey_var.set("Press a key combo...")
-        elif target == "grammar":
-            self._grammar_hotkey_var.set("Press a key combo...")
-        else:
-            self._rephrase_hotkey_var.set("Press a key combo...")
-        self._record_btn.config(state="disabled")
-        self._record_dict_btn.config(state="disabled")
-        self._record_grammar_btn.config(state="disabled")
-        self._record_rephrase_btn.config(state="disabled")
+
+        # Find the right var and set placeholder
+        var = self._get_var_for_target(target)
+        if var:
+            self._prev_record_value = var.get()
+            var.set("Press a key combo…")
+
+        for b in self._record_buttons:
+            b.config(state="disabled")
 
         def capture():
             try:
@@ -1112,23 +1217,50 @@ class SettingsWindow:
 
     def _finish_record(self, combo):
         self._recording = False
-        self._record_btn.config(state="normal")
-        self._record_dict_btn.config(state="normal")
-        self._record_grammar_btn.config(state="normal")
-        self._record_rephrase_btn.config(state="normal")
+        for b in self._record_buttons:
+            b.config(state="normal")
+        target = self._record_target
         if combo:
-            if self._record_target == "dictation":
-                self._dictation_hotkey_var.set(combo)
-            elif self._record_target == "grammar":
-                self._grammar_hotkey_var.set(combo)
-            elif self._record_target == "rephrase":
-                self._rephrase_hotkey_var.set(combo)
-            else:
-                self._hotkey_var.set(combo)
+            var = self._get_var_for_target(target)
+            if var:
+                var.set(combo)
+        else:
+            var = self._get_var_for_target(target)
+            if var and hasattr(self, "_prev_record_value"):
+                var.set(self._prev_record_value)
         self._record_target = None
 
+    def _get_var_for_target(self, target):
+        """Return the StringVar for a given recording target."""
+        mapping = {
+            "read": self._hotkey_var,
+            "dictation": self._dictation_hotkey_var,
+            "grammar": self._grammar_hotkey_var,
+            "recall_style": self._recall_style_hotkey_var,
+        }
+        if target in mapping:
+            return mapping[target]
+        if target and target.startswith("style_"):
+            style_name = target[6:]
+            return self._style_hotkey_vars.get(style_name)
+        return None
+
+    @staticmethod
+    def _get_mic_device_names():
+        """Return list of available input device names, with 'System default' first."""
+        names = ["System default"]
+        try:
+            devices = sd.query_devices()
+            for d in devices:
+                if d["max_input_channels"] > 0:
+                    names.append(d["name"])
+        except Exception:
+            pass
+        return names
+
+    # ── Voice / Speed Previews ───────────────────────────────────────────────
+
     def _on_en_voice_changed(self, event):
-        """Auto-preview when English voice dropdown changes."""
         label = self._voice_en_var.get()
         if label in self._en_labels:
             idx = self._en_labels.index(label)
@@ -1139,7 +1271,6 @@ class SettingsWindow:
             self._app.tts.speak_preview("Hello! This is a preview.", code, "en-us")
 
     def _on_es_voice_changed(self, event):
-        """Auto-preview when Spanish voice dropdown changes."""
         label = self._voice_es_var.get()
         if label in self._es_labels:
             idx = self._es_labels.index(label)
@@ -1150,8 +1281,6 @@ class SettingsWindow:
             self._app.tts.speak_preview("Hola, esta es una vista previa.", code, "es")
 
     def _on_speed_changed(self, event):
-        """Auto-preview when speed dropdown changes."""
-        # Preview with the current English voice at new speed
         en_label = self._voice_en_var.get()
         if en_label in self._en_labels:
             idx = self._en_labels.index(en_label)
@@ -1163,8 +1292,10 @@ class SettingsWindow:
         self._app.tts.set_speed(speed)
         self._app.tts.speak_preview("Hello! This is a preview.", code, "en-us")
 
+    # ── Save ─────────────────────────────────────────────────────────────────
+
     def _save(self):
-        # Resolve selected values
+        # Resolve voices
         en_label = self._voice_en_var.get()
         idx_en = self._en_labels.index(en_label) if en_label in self._en_labels else 0
         voice_en = self._en_codes[idx_en]
@@ -1177,38 +1308,64 @@ class SettingsWindow:
         hotkey = self._hotkey_var.get()
         dictation_hotkey = self._dictation_hotkey_var.get()
         grammar_hotkey = self._grammar_hotkey_var.get()
-        rephrase_hotkey = self._rephrase_hotkey_var.get()
+        rephrase_hotkey = ""
         rephrase_style = self._rephrase_style_var.get() or DEFAULT_REPHRASE_STYLE
+        recall_style_hotkey = self._recall_style_hotkey_var.get().strip()
         grammar_mode = self._grammar_mode_var.get()
         dictation_provider = self._dictation_provider_var.get()
         grammar_provider = self._grammar_provider_var.get()
+        mic_choice = self._mic_device_var.get()
+        mic_device = "" if mic_choice == "System default" else mic_choice
         anthropic_api_key = self._anthropic_api_key_var.get().strip()
         anthropic_model = self._anthropic_model_var.get().strip() or ANTHROPIC_MODEL_DEFAULT
 
-        shortcuts = {"Read-aloud": hotkey, "Dictation": dictation_hotkey, "Grammar": grammar_hotkey, "Rephrase": rephrase_hotkey}
+        # Collect per-style hotkeys
+        style_hotkeys = {}
+        for style_name in REPHRASE_STYLES:
+            val = self._style_hotkey_vars[style_name].get().strip()
+            if val and val != "Press a key combo…":
+                style_hotkeys[style_name] = val
+            else:
+                style_hotkeys[style_name] = ""
+
+        # Conflict check — collect all non-empty hotkeys
+        all_shortcuts = {
+            "Read-aloud": hotkey,
+            "Dictation": dictation_hotkey,
+            "Grammar": grammar_hotkey,
+        }
+        if recall_style_hotkey:
+            all_shortcuts["Recall last style"] = recall_style_hotkey
+        for sn, sh in style_hotkeys.items():
+            if sh:
+                all_shortcuts[f"Rephrase ({sn})"] = sh
+
         seen = {}
-        for name, key in shortcuts.items():
+        for name, key in all_shortcuts.items():
+            if not key:
+                continue
             if key in seen:
                 messagebox.showerror("Shortcut conflict",
-                    f"{name} and {seen[key]} shortcuts must be different.")
+                    f"{name} and {seen[key]} shortcuts must be different.",
+                    parent=self._root)
                 return
             seen[key] = name
+
         if grammar_mode not in GRAMMAR_MODES:
-            messagebox.showerror("Invalid setting", "Please select a valid grammar mode.")
+            messagebox.showerror("Invalid setting", "Please select a valid grammar mode.", parent=self._root)
             return
         if dictation_provider not in DICTATION_PROVIDERS:
-            messagebox.showerror("Invalid setting", "Please select a valid dictation provider.")
+            messagebox.showerror("Invalid setting", "Please select a valid dictation provider.", parent=self._root)
             return
         if grammar_provider not in GRAMMAR_PROVIDERS:
-            messagebox.showerror("Invalid setting", "Please select a valid grammar provider.")
+            messagebox.showerror("Invalid setting", "Please select a valid grammar provider.", parent=self._root)
             return
 
-        # Apply to TTS worker
+        # Apply
         self._app.tts.set_voice_en(voice_en)
         self._app.tts.set_voice_es(voice_es)
         self._app.tts.set_speed(speed)
 
-        # Re-register hotkey if changed
         if hotkey != self._app._hotkey:
             self._app._update_hotkey(hotkey)
         if dictation_hotkey != self._app._dictation_hotkey:
@@ -1216,11 +1373,19 @@ class SettingsWindow:
         if grammar_hotkey != self._app._grammar_hotkey:
             self._app._update_grammar_hotkey(grammar_hotkey)
         if rephrase_hotkey != self._app._rephrase_hotkey:
-            self._app._update_rephrase_hotkey(rephrase_hotkey)
+            if self._app._rephrase_hotkey_handle is not None:
+                keyboard.remove_hotkey(self._app._rephrase_hotkey_handle)
+                self._app._rephrase_hotkey_handle = None
+            self._app._rephrase_hotkey = rephrase_hotkey
         self._app._grammar_mode = grammar_mode
         self._app._dictation_provider = dictation_provider
         self._app._grammar_provider = grammar_provider
+        self._app._mic_device = mic_device
+        self._app._apply_mic_device()
         self._app._rephrase_style = rephrase_style
+        self._app._style_hotkeys = style_hotkeys
+        self._app._recall_style_hotkey = recall_style_hotkey
+        self._app._register_style_hotkeys()
         _sb = FloatingStatusBar.get()
         if _sb:
             _sb.sync_style()
@@ -1228,19 +1393,21 @@ class SettingsWindow:
         self._app._anthropic_model = anthropic_model
         self._app._refresh_menu()
 
-        # Persist
         save_config({
             "hotkey": hotkey,
             "dictation_hotkey": dictation_hotkey,
             "grammar_hotkey": grammar_hotkey,
             "rephrase_hotkey": rephrase_hotkey,
             "rephrase_style": rephrase_style,
+            "style_hotkeys": style_hotkeys,
+            "recall_style_hotkey": recall_style_hotkey,
             "voice_en": voice_en,
             "voice_es": voice_es,
             "speed": speed,
             "grammar_mode": grammar_mode,
             "dictation_provider": dictation_provider,
             "grammar_provider": grammar_provider,
+            "mic_device": mic_device,
             "anthropic_api_key": anthropic_api_key,
             "anthropic_model": anthropic_model,
         })
@@ -1294,11 +1461,10 @@ class TTSWorker:
         return self._current_speed
 
     def speak(self, text):
-        if not self._speaking:
-            lang = detect_language(text)
-            voice = self._voice_es if lang == "es" else self._voice_en
-            kokoro_lang = _KOKORO_LANG.get(lang, "en-us")
-            self._queue.put(("speak", (text, voice, kokoro_lang)))
+        lang = detect_language(text)
+        voice = self._voice_es if lang == "es" else self._voice_en
+        kokoro_lang = _KOKORO_LANG.get(lang, "en-us")
+        self._queue.put(("speak", (text, voice, kokoro_lang)))
 
     def speak_preview(self, text, voice, kokoro_lang):
         """Speak a preview with an explicit voice and lang (skips detection).
@@ -1423,7 +1589,11 @@ class TinyReadAloud:
         self._grammar_mode = cfg["grammar_mode"]
         self._dictation_provider = cfg["dictation_provider"]
         self._grammar_provider = cfg["grammar_provider"]
+        self._mic_device = cfg.get("mic_device", DEFAULT_MIC_DEVICE)
         self._rephrase_style = cfg["rephrase_style"]
+        self._style_hotkeys = cfg.get("style_hotkeys", dict(DEFAULT_STYLE_HOTKEYS))
+        self._recall_style_hotkey = cfg.get("recall_style_hotkey", RECALL_STYLE_HOTKEY)
+        self._last_rephrase_style = self._rephrase_style
         self._anthropic_api_key = cfg["anthropic_api_key"]
         self._anthropic_model = cfg["anthropic_model"]
         self.tts = TTSWorker()
@@ -1436,9 +1606,15 @@ class TinyReadAloud:
         self._dictation_hotkey_handle = None
         self._grammar_hotkey_handle = None
         self._rephrase_hotkey_handle = None
+        self._style_hotkey_handles = {}
+        self._recall_style_hotkey_handle = None
         self._status_bar = None
         self._dictation_listening = False
         self._update_info = None
+        self._grammar_cancel = threading.Event()
+        self._rephrase_cancel = threading.Event()
+        self._grammar_thread = None
+        self._rephrase_thread = None
         self._icon_idle = create_tray_icon(speaking=False)
         self._icon_speaking = create_tray_icon(speaking=True)
 
@@ -1454,19 +1630,25 @@ class TinyReadAloud:
     def _on_ready(self, icon):
         icon.visible = True
         self.tts.start()
+        self._apply_mic_device()
         time.sleep(1.0)  # give Kokoro time to load
         icon.menu = self._build_menu()
         icon.update_menu()
-        self._hotkey_handle = keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=True)
-        self._dictation_hotkey_handle = keyboard.add_hotkey(
-            self._dictation_hotkey, self._on_dictation_hotkey, suppress=True
-        )
-        self._grammar_hotkey_handle = keyboard.add_hotkey(
-            self._grammar_hotkey, self._on_grammar_hotkey, suppress=True
-        )
-        self._rephrase_hotkey_handle = keyboard.add_hotkey(
-            self._rephrase_hotkey, self._on_rephrase_hotkey, suppress=True
-        )
+        if self._hotkey:
+            self._hotkey_handle = keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=False)
+        if self._dictation_hotkey:
+            self._dictation_hotkey_handle = keyboard.add_hotkey(
+                self._dictation_hotkey, self._on_dictation_hotkey, suppress=False
+            )
+        if self._grammar_hotkey:
+            self._grammar_hotkey_handle = keyboard.add_hotkey(
+                self._grammar_hotkey, self._on_grammar_hotkey, suppress=False
+            )
+        if self._rephrase_hotkey:
+            self._rephrase_hotkey_handle = keyboard.add_hotkey(
+                self._rephrase_hotkey, self._on_rephrase_hotkey, suppress=False
+            )
+        self._register_style_hotkeys()
         FloatingStatusBar.open(self)
         self._status_bar = FloatingStatusBar.get()
         print(
@@ -1568,36 +1750,122 @@ class TinyReadAloud:
         return setter
 
     def _on_hotkey(self):
-        if self.tts.is_speaking:
-            self.tts.stop()
-        else:
-            threading.Thread(target=self._capture_and_speak, daemon=True).start()
+        self.tts.stop()
+        threading.Thread(target=self._capture_and_speak, daemon=True).start()
 
     def _on_dictation_hotkey(self):
-        self._toggle_dictation()
+        threading.Thread(target=self._toggle_dictation, daemon=True).start()
 
     def _on_grammar_hotkey(self):
         if self._grammar_mode == "off":
             return
+        # Cancel any in-progress grammar or rephrase operation
+        self._grammar_cancel.set()
+        self._rephrase_cancel.set()
+        self.tts.stop()
         target_hwnd = (
             self._status_bar._last_target_hwnd
             if self._status_bar is not None
             else user32.GetForegroundWindow()
         ) or user32.GetForegroundWindow()
         print(f"[Grammar] Hotkey fired. target_hwnd={target_hwnd:#010x}", flush=True)
-        threading.Thread(target=self._run_grammar_select_all, args=(target_hwnd,), daemon=True).start()
+        t = threading.Thread(target=self._run_grammar_select_all, args=(target_hwnd,), daemon=True)
+        self._grammar_thread = t
+        t.start()
 
     def _on_rephrase_hotkey(self):
+        # NOTE: this runs in the keyboard hook thread — must return in <300ms or
+        # Windows kills the hook. No blocking calls (icon.notify, sleeps, etc.) here.
+        self._rephrase_cancel.set()
+        self._grammar_cancel.set()
+        self.tts.stop()
         target_hwnd = (
             self._status_bar._last_target_hwnd
             if self._status_bar is not None
             else user32.GetForegroundWindow()
         ) or user32.GetForegroundWindow()
         style = self._rephrase_style
+        self._last_rephrase_style = style
         print(f"[Rephrase] Hotkey fired. target_hwnd={target_hwnd:#010x}  style={style!r}", flush=True)
-        if self.icon:
-            self.icon.notify(f"Rephrase hotkey fired ({style})", "Rephrase")
-        threading.Thread(target=self._run_rephrase_select_all, args=(target_hwnd,), daemon=True).start()
+        t = threading.Thread(target=self._run_rephrase_select_all, args=(target_hwnd,), daemon=True)
+        self._rephrase_thread = t
+        t.start()
+
+    def _register_style_hotkeys(self):
+        """Register per-style hotkeys and recall-last-style hotkey."""
+        # Remove old handles
+        for h in self._style_hotkey_handles.values():
+            try:
+                keyboard.remove_hotkey(h)
+            except Exception:
+                pass
+        self._style_hotkey_handles.clear()
+        if self._recall_style_hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self._recall_style_hotkey_handle)
+            except Exception:
+                pass
+            self._recall_style_hotkey_handle = None
+
+        # Register per-style hotkeys
+        for style, hk in self._style_hotkeys.items():
+            if hk and hk.strip():
+                try:
+                    self._style_hotkey_handles[style] = keyboard.add_hotkey(
+                        hk, self._on_style_hotkey, args=(style,), suppress=False
+                    )
+                except Exception as e:
+                    print(f"[StyleHotkey] Failed to register {style}={hk}: {e}", flush=True)
+
+        # Register recall-last-style hotkey
+        if self._recall_style_hotkey and self._recall_style_hotkey.strip():
+            try:
+                self._recall_style_hotkey_handle = keyboard.add_hotkey(
+                    self._recall_style_hotkey, self._on_recall_style_hotkey, suppress=False
+                )
+            except Exception as e:
+                print(f"[StyleHotkey] Failed to register recall={self._recall_style_hotkey}: {e}", flush=True)
+
+    def _on_style_hotkey(self, style):
+        """Rephrase using a specific style via its dedicated hotkey."""
+        self._last_rephrase_style = self._rephrase_style
+        self._rephrase_style = style
+        sb = FloatingStatusBar.get()
+        if sb:
+            sb.sync_style()
+        self._rephrase_cancel.set()
+        self._grammar_cancel.set()
+        self.tts.stop()
+        target_hwnd = (
+            self._status_bar._last_target_hwnd
+            if self._status_bar is not None
+            else user32.GetForegroundWindow()
+        ) or user32.GetForegroundWindow()
+        print(f"[Rephrase] Style hotkey fired. style={style!r} target={target_hwnd:#010x}", flush=True)
+        t = threading.Thread(target=self._run_rephrase_select_all, args=(target_hwnd,), daemon=True)
+        self._rephrase_thread = t
+        t.start()
+
+    def _on_recall_style_hotkey(self):
+        """Switch back to the last used rephrase style and trigger rephrase."""
+        prev = self._last_rephrase_style
+        self._last_rephrase_style = self._rephrase_style
+        self._rephrase_style = prev
+        sb = FloatingStatusBar.get()
+        if sb:
+            sb.sync_style()
+        self._rephrase_cancel.set()
+        self._grammar_cancel.set()
+        self.tts.stop()
+        target_hwnd = (
+            self._status_bar._last_target_hwnd
+            if self._status_bar is not None
+            else user32.GetForegroundWindow()
+        ) or user32.GetForegroundWindow()
+        print(f"[Rephrase] Recall style hotkey fired. style={prev!r} target={target_hwnd:#010x}", flush=True)
+        t = threading.Thread(target=self._run_rephrase_select_all, args=(target_hwnd,), daemon=True)
+        self._rephrase_thread = t
+        t.start()
 
     def _capture_and_speak(self):
         text = capture_selected_text()
@@ -1618,13 +1886,39 @@ class TinyReadAloud:
 
     def _cmd_stop(self, icon, item):
         self.tts.stop()
+        self._grammar_cancel.set()
+        self._rephrase_cancel.set()
 
     def _cmd_toggle_dictation(self, icon, item):
         self._toggle_dictation()
 
+    def _apply_mic_device(self):
+        """Set the sounddevice default input device from config."""
+        if self._mic_device:
+            try:
+                devices = sd.query_devices()
+                for i, d in enumerate(devices):
+                    if d["name"] == self._mic_device and d["max_input_channels"] > 0:
+                        # Only set input device; preserve output device
+                        cur_out = sd.default.device
+                        # Extract raw output index from _InputOutputPair or plain value
+                        if hasattr(cur_out, 'output'):
+                            out_idx = cur_out.output
+                        elif hasattr(cur_out, '__getitem__') and not isinstance(cur_out, (int, str)):
+                            out_idx = cur_out[1]
+                        else:
+                            out_idx = None
+                        sd.default.device = [i, out_idx]
+                        print(f"[Mic] Set input device to: {self._mic_device} (index {i})", flush=True)
+                        return
+                print(f"[Mic] Device not found: {self._mic_device!r}, using system default.", flush=True)
+            except Exception as e:
+                print(f"[Mic] Error setting device: {e}", flush=True)
+
     def _toggle_dictation(self):
         try:
             if self._dictation_provider == "windows":
+                _wait_for_modifiers_released()
                 keyboard.send("windows+h")
             else:
                 raise RuntimeError(f"Unsupported dictation provider: {self._dictation_provider}")
@@ -1670,9 +1964,10 @@ class TinyReadAloud:
             except Exception:
                 pass
             try:
-                setattr(self, attr, keyboard.add_hotkey(hotkey, cb, suppress=True))
+                setattr(self, attr, keyboard.add_hotkey(hotkey, cb, suppress=False))
             except Exception:
                 pass
+        self._register_style_hotkeys()
 
     def _run_grammar_select_all(self, target_hwnd=None):
         """Ctrl+A → Ctrl+C → grammar check → Ctrl+A → Ctrl+V corrected text → Ctrl+End."""
@@ -1683,10 +1978,11 @@ class TinyReadAloud:
             print(f"[Grammar] UNHANDLED EXCEPTION:\n{traceback.format_exc()}", flush=True)
             self._set_status("Grammar error.")
         finally:
-            # Re-register hotkeys so suppress=True state is fresh for the next press
+            # Re-register hotkeys so state is fresh for the next press
             self._reset_hotkeys()
 
     def _run_grammar_inner(self, target_hwnd=None):
+        self._grammar_cancel.clear()
 
         # Restore keyboard focus to the target window (prevents FloatingStatusBar from
         # intercepting our ctrl+a / ctrl+c / ctrl+v sends)
@@ -1700,6 +1996,10 @@ class TinyReadAloud:
         # Clear clipboard so we can detect when Ctrl+C actually updates it
         clipboard_clear()
         time.sleep(0.1)
+
+        # Wait for modifier keys to be physically released before injecting
+        # ctrl+a / ctrl+c, otherwise target app receives ctrl+alt+a etc.
+        _wait_for_modifiers_released()
 
         keyboard.send("ctrl+a")
         time.sleep(0.2)
@@ -1749,6 +2049,11 @@ class TinyReadAloud:
 
         print(f"[Grammar] Corrected {len(corrected)} chars.", flush=True)
 
+        if self._grammar_cancel.is_set():
+            print("[Grammar] Cancelled after API call.", flush=True)
+            self._set_status("Cancelled.")
+            return
+
         if corrected.strip() == text.strip():
             keyboard.send("ctrl+end")
             self._set_status("No changes.")
@@ -1792,10 +2097,11 @@ class TinyReadAloud:
             print(f"[Rephrase] UNHANDLED EXCEPTION:\n{traceback.format_exc()}", flush=True)
             self._set_status("Rephrase error.")
         finally:
-            # Re-register hotkeys so suppress=True state is fresh for the next press
+            # Re-register hotkeys so state is fresh for the next press
             self._reset_hotkeys()
 
     def _run_rephrase_inner(self, target_hwnd=None):
+        self._rephrase_cancel.clear()
         time.sleep(0.3)
 
         # --- Phase 1: Focus capture window ---
@@ -1810,6 +2116,10 @@ class TinyReadAloud:
 
         clipboard_clear()
         time.sleep(0.1)
+
+        # Wait for modifier keys to be physically released before injecting
+        # ctrl+a / ctrl+c, otherwise target app receives ctrl+alt+a etc.
+        _wait_for_modifiers_released()
 
         fg_pre_copy = user32.GetForegroundWindow()
         print(f"[Rephrase] Before ctrl+a/ctrl+c: fg={fg_pre_copy:#010x}", flush=True)
@@ -1839,6 +2149,11 @@ class TinyReadAloud:
         if self.icon:
             self.icon.notify(f"Rephrasing ({len(text)} chars)…", "Rephrase")
 
+        if self._rephrase_cancel.is_set():
+            print("[Rephrase] Cancelled before API call.", flush=True)
+            self._set_status("Cancelled.")
+            return
+
         try:
             rephrased = rephrase_text(
                 text,
@@ -1865,6 +2180,11 @@ class TinyReadAloud:
         print(f"[Rephrase] API done. Output[:200]={rephrased[:200]!r}", flush=True)
         same = rephrased.strip() == text.strip()
         print(f"[Rephrase] Same as input? {same}", flush=True)
+
+        if self._rephrase_cancel.is_set():
+            print("[Rephrase] Cancelled after API call.", flush=True)
+            self._set_status("Cancelled.")
+            return
 
         # --- Phase 2: Focus capture window again, paste result ---
         fg_pre_paste = user32.GetForegroundWindow()
@@ -1954,39 +2274,59 @@ class TinyReadAloud:
     def _update_hotkey(self, new_hotkey):
         """Re-register the global hotkey and update tooltip."""
         if self._hotkey_handle is not None:
-            keyboard.remove_hotkey(self._hotkey_handle)
+            try:
+                keyboard.remove_hotkey(self._hotkey_handle)
+            except (KeyError, ValueError):
+                pass
+            self._hotkey_handle = None
         self._hotkey = new_hotkey
-        self._hotkey_handle = keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=True)
+        if new_hotkey:
+            self._hotkey_handle = keyboard.add_hotkey(self._hotkey, self._on_hotkey, suppress=False)
         if self.icon:
             self.icon.title = f"TinyReadAloud v{__version__}  [Read: {self._hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}]"
 
     def _update_dictation_hotkey(self, new_hotkey):
         if self._dictation_hotkey_handle is not None:
-            keyboard.remove_hotkey(self._dictation_hotkey_handle)
+            try:
+                keyboard.remove_hotkey(self._dictation_hotkey_handle)
+            except (KeyError, ValueError):
+                pass
+            self._dictation_hotkey_handle = None
         self._dictation_hotkey = new_hotkey
-        self._dictation_hotkey_handle = keyboard.add_hotkey(
-            self._dictation_hotkey, self._on_dictation_hotkey, suppress=True
-        )
+        if new_hotkey:
+            self._dictation_hotkey_handle = keyboard.add_hotkey(
+                self._dictation_hotkey, self._on_dictation_hotkey, suppress=False
+            )
         if self.icon:
             self.icon.title = f"TinyReadAloud v{__version__}  [Read: {self._hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}]"
 
     def _update_grammar_hotkey(self, new_hotkey):
         if self._grammar_hotkey_handle is not None:
-            keyboard.remove_hotkey(self._grammar_hotkey_handle)
+            try:
+                keyboard.remove_hotkey(self._grammar_hotkey_handle)
+            except (KeyError, ValueError):
+                pass
+            self._grammar_hotkey_handle = None
         self._grammar_hotkey = new_hotkey
-        self._grammar_hotkey_handle = keyboard.add_hotkey(
-            self._grammar_hotkey, self._on_grammar_hotkey, suppress=True
-        )
+        if new_hotkey:
+            self._grammar_hotkey_handle = keyboard.add_hotkey(
+                self._grammar_hotkey, self._on_grammar_hotkey, suppress=False
+            )
         if self.icon:
             self.icon.title = f"TinyReadAloud v{__version__}  [Read: {self._hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}]"
 
     def _update_rephrase_hotkey(self, new_hotkey):
         if self._rephrase_hotkey_handle is not None:
-            keyboard.remove_hotkey(self._rephrase_hotkey_handle)
+            try:
+                keyboard.remove_hotkey(self._rephrase_hotkey_handle)
+            except (KeyError, ValueError):
+                pass
+            self._rephrase_hotkey_handle = None
         self._rephrase_hotkey = new_hotkey
-        self._rephrase_hotkey_handle = keyboard.add_hotkey(
-            self._rephrase_hotkey, self._on_rephrase_hotkey, suppress=True
-        )
+        if new_hotkey:
+            self._rephrase_hotkey_handle = keyboard.add_hotkey(
+                self._rephrase_hotkey, self._on_rephrase_hotkey, suppress=False
+            )
         if self.icon:
             self.icon.title = f"TinyReadAloud v{__version__}  [Read: {self._hotkey} | Dictation: {self._dictation_hotkey} | Grammar: {self._grammar_hotkey} | Rephrase: {self._rephrase_hotkey}]"
 
@@ -2004,6 +2344,16 @@ class TinyReadAloud:
             keyboard.remove_hotkey(self._grammar_hotkey_handle)
         if self._rephrase_hotkey_handle is not None:
             keyboard.remove_hotkey(self._rephrase_hotkey_handle)
+        for h in self._style_hotkey_handles.values():
+            try:
+                keyboard.remove_hotkey(h)
+            except Exception:
+                pass
+        if self._recall_style_hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self._recall_style_hotkey_handle)
+            except Exception:
+                pass
         self.tts.quit()
         icon.stop()
 
