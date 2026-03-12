@@ -134,6 +134,49 @@ kernel32.GlobalUnlock.restype = ctypes.wintypes.BOOL
 kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
 kernel32.GlobalFree.restype = ctypes.c_void_p
 
+# ── Win32 focus / caret detection ─────────────────────────────────────────────
+
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize",        ctypes.wintypes.DWORD),
+        ("flags",         ctypes.wintypes.DWORD),
+        ("hwndActive",    ctypes.wintypes.HWND),
+        ("hwndFocus",     ctypes.wintypes.HWND),
+        ("hwndCapture",   ctypes.wintypes.HWND),
+        ("hwndMenuOwner", ctypes.wintypes.HWND),
+        ("hwndMoveSize",  ctypes.wintypes.HWND),
+        ("hwndCaret",     ctypes.wintypes.HWND),
+        ("rcCaret",       ctypes.wintypes.RECT),
+    ]
+
+user32.GetGUIThreadInfo.argtypes = [ctypes.wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+user32.GetGUIThreadInfo.restype = ctypes.wintypes.BOOL
+user32.GetWindowThreadProcessId.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+user32.GetClassNameW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+
+_DESKTOP_CLASSES = frozenset({"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"})
+
+def _is_textfield_focused():
+    """Return True if the foreground window likely has a text field focused."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    # Check if the foreground window is the desktop / taskbar
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    if buf.value in _DESKTOP_CLASSES:
+        return False
+    # Get GUI thread info for the foreground window's thread
+    tid = user32.GetWindowThreadProcessId(hwnd, None)
+    gti = GUITHREADINFO()
+    gti.cbSize = ctypes.sizeof(GUITHREADINFO)
+    if user32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
+        if not gti.hwndFocus:
+            return False
+    return True
+
 # ── Win32 modifier key helpers ────────────────────────────────────────────────
 
 _VK_CONTROL = 0x11
@@ -1615,6 +1658,11 @@ class TinyReadAloud:
         self._rephrase_cancel = threading.Event()
         self._grammar_thread = None
         self._rephrase_thread = None
+        self._anykey_hook = None
+        self._stopped_by_key = False
+        self._speaking_since = 0
+        self._dictation_anykey_hook = None
+        self._dictation_started_at = 0
         self._icon_idle = create_tray_icon(speaking=False)
         self._icon_speaking = create_tray_icon(speaking=True)
 
@@ -1878,6 +1926,60 @@ class TinyReadAloud:
                 self._icon_speaking if is_speaking else self._icon_idle
             )
         self._set_status("Speaking…" if is_speaking else "Ready")
+        # Any-key-stops-playback
+        if is_speaking:
+            self._speaking_since = time.monotonic()
+            try:
+                self._anykey_hook = keyboard.on_press(self._on_anykey_stop)
+            except Exception:
+                pass
+        else:
+            hook = self._anykey_hook
+            if hook is not None:
+                try:
+                    keyboard.unhook(hook)
+                except (KeyError, ValueError):
+                    pass
+                self._anykey_hook = None
+            # After stopping via any-key press, run grammar check
+            if self._stopped_by_key:
+                self._stopped_by_key = False
+                if self._grammar_mode != "off":
+                    target_hwnd = (
+                        self._status_bar._last_target_hwnd
+                        if self._status_bar is not None
+                        else user32.GetForegroundWindow()
+                    ) or user32.GetForegroundWindow()
+                    self._grammar_cancel.set()
+                    t = threading.Thread(
+                        target=self._run_grammar_select_all,
+                        args=(target_hwnd,), daemon=True,
+                    )
+                    self._grammar_thread = t
+                    t.start()
+
+    def _on_anykey_stop(self, event):
+        """Stop TTS playback when any key is pressed."""
+        if time.monotonic() - self._speaking_since < 0.5:
+            return  # ignore keys from the hotkey that triggered playback
+        self._stopped_by_key = True
+        self.tts.stop()
+
+    def _on_anykey_stop_dictation(self, event):
+        """Stop dictation when any key is pressed during listening."""
+        if time.monotonic() - self._dictation_started_at < 0.8:
+            return  # ignore keys from the hotkey that started dictation
+        # Run toggle in a separate thread (sends Win+H and triggers grammar)
+        threading.Thread(target=self._toggle_dictation, daemon=True).start()
+
+    def _unhook_dictation_anykey(self):
+        hook = self._dictation_anykey_hook
+        if hook is not None:
+            try:
+                keyboard.unhook(hook)
+            except (KeyError, ValueError):
+                pass
+            self._dictation_anykey_hook = None
 
     def _set_status(self, text):
         """Update the floating status bar (no-op if not open)."""
@@ -1917,6 +2019,15 @@ class TinyReadAloud:
 
     def _toggle_dictation(self):
         try:
+            # When starting dictation, verify a text field is focused
+            if not self._dictation_listening and not _is_textfield_focused():
+                self._set_status("No text field focused — click a text field first")
+                if self.icon:
+                    self.icon.notify(
+                        "Focus a text field before starting dictation.",
+                        "TinyReadAloud",
+                    )
+                return
             if self._dictation_provider == "windows":
                 _wait_for_modifiers_released()
                 keyboard.send("windows+h")
@@ -1928,11 +2039,31 @@ class TinyReadAloud:
             if self.icon:
                 state = "Dictation listening started" if self._dictation_listening else "Dictation listening stopped"
                 self.icon.notify(state, "TinyReadAloud")
-            if (not self._dictation_listening) and self._grammar_mode == "after_dictation":
-                threading.Thread(
-                    target=self._run_grammar_select_all,
-                    daemon=True,
-                ).start()
+            # Hook / unhook any-key-stops-dictation
+            if self._dictation_listening:
+                self._dictation_started_at = time.monotonic()
+                try:
+                    self._dictation_anykey_hook = keyboard.on_press(
+                        self._on_anykey_stop_dictation
+                    )
+                except Exception:
+                    pass
+            else:
+                self._unhook_dictation_anykey()
+                # Always run grammar after dictation stops (if grammar not off)
+                if self._grammar_mode != "off":
+                    target_hwnd = (
+                        self._status_bar._last_target_hwnd
+                        if self._status_bar is not None
+                        else user32.GetForegroundWindow()
+                    ) or user32.GetForegroundWindow()
+                    self._grammar_cancel.set()
+                    t = threading.Thread(
+                        target=self._run_grammar_select_all,
+                        args=(target_hwnd,), daemon=True,
+                    )
+                    self._grammar_thread = t
+                    t.start()
         except Exception as e:
             if self.icon:
                 self.icon.notify(f"Dictation toggle failed: {e}", "Dictation Error")
